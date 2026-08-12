@@ -147,11 +147,11 @@ def test_load_from_database_import_error(seed_manager):
             seed_manager.load_from_database("sqlite:///:memory:", query="SELECT 1")
         assert "Database ingestion module not available" in str(excinfo.value)
 
-@patch("requests.get")
-def test_load_from_api(mock_get, seed_manager):
+@patch("semantica.seed.seed_manager.request_with_ssrf_guard")
+def test_load_from_api(mock_request, seed_manager):
     mock_response = MagicMock()
     mock_response.json.return_value = {"results": [{"id": 1, "name": "Alice"}]}
-    mock_get.return_value = mock_response
+    mock_request.return_value = mock_response
 
     records = seed_manager.load_from_api(
         api_url="http://api.example.com",
@@ -162,7 +162,47 @@ def test_load_from_api(mock_get, seed_manager):
     assert len(records) == 1
     assert records[0]["id"] == 1
     assert records[0]["entity_type"] == "User"
-    mock_get.assert_called_once()
+    mock_request.assert_called_once_with(
+        "GET",
+        "http://api.example.com/users",
+        headers={},
+        timeout=30,
+    )
+
+
+@patch("semantica.ingest.ssrf.requests.request")
+def test_load_from_api_blocks_loopback_without_network_request(
+    mock_raw_request, seed_manager
+):
+    with pytest.raises(ProcessingError, match="blocked"):
+        seed_manager.load_from_api("http://127.0.0.1:8080/internal")
+
+    mock_raw_request.assert_not_called()
+
+
+@patch("semantica.ingest.ssrf.socket.getaddrinfo")
+@patch("semantica.ingest.ssrf.requests.request")
+def test_load_from_api_blocks_redirect_to_metadata_endpoint(
+    mock_raw_request, mock_getaddrinfo, seed_manager
+):
+    redirect = MagicMock()
+    redirect.status_code = 302
+    redirect.headers = {"Location": "http://169.254.169.254/latest/meta-data/"}
+    mock_raw_request.return_value = redirect
+    mock_getaddrinfo.return_value = [
+        (None, None, None, None, ("93.184.216.34", 0))
+    ]
+
+    with pytest.raises(ProcessingError, match="blocked"):
+        seed_manager.load_from_api("https://api.example.com/records")
+
+    mock_raw_request.assert_called_once_with(
+        "GET",
+        "https://api.example.com/records",
+        allow_redirects=False,
+        headers={},
+        timeout=30,
+    )
 
 def test_load_source(seed_manager, temp_data_dir):
     json_file = temp_data_dir / "source.json"
