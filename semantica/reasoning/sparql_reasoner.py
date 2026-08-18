@@ -84,6 +84,9 @@ class SPARQLReasoner:
         self.triplet_store = self.config.get("triplet_store")
         self.enable_inference = self.config.get("enable_inference", True)
 
+        # Reserved for query caching once a triplet-store execution path
+        # lands. execute_query() raises NotImplementedError until then, so
+        # the cache cannot be populated through any public path yet.
         self.query_cache: Dict[str, Any] = {}
 
     def expand_query(self, query: str, **options) -> str:
@@ -338,9 +341,6 @@ class SPARQLReasoner:
             query: SPARQL query string
             **options: Additional options
 
-        Returns:
-            Query results
-
         Raises:
             NotImplementedError: always, until a triplet-store execution
                 path lands.
@@ -353,7 +353,12 @@ class SPARQLReasoner:
         )
 
     def clear_cache(self) -> None:
-        """Clear query cache."""
+        """Clear query cache.
+
+        Reserved for when a triplet-store execution path lands: until then,
+        ``execute_query()`` raises ``NotImplementedError`` and nothing can
+        populate the cache.
+        """
         self.query_cache.clear()
 
     def add_inference_rule(self, rule_definition: str, **options) -> Rule:
