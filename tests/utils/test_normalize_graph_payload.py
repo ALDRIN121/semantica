@@ -520,6 +520,30 @@ class TestKeyDisplayBounds(unittest.TestCase):
         self.assertEqual(list(payload), [big_key])
         self.assertEqual(payload[big_key], [ENTITY])
 
+    def test_many_unrecognized_keys_are_summarized(self):
+        """Per-key truncation does not bound the number of keys shown.
+
+        A payload carrying many short unrecognized keys would still size the
+        message (and the log entry that records it), so the count of
+        displayed keys is bounded too.
+        """
+        payload = {f"key_{i}": [ENTITY] for i in range(100)}
+        with self.assertRaises(ValidationError) as ctx:
+            normalize_graph_payload(payload)
+
+        message = str(ctx.exception)
+        self.assertLess(len(message), 500)
+        self.assertIn("and 92 more", message)
+
+    def test_many_dropped_record_keys_are_summarized(self):
+        payload = {"entities": [], **{f"data_{i}": [ENTITY] for i in range(100)}}
+        with self.assertRaises(ValidationError) as ctx:
+            normalize_graph_payload(payload)
+
+        message = str(ctx.exception)
+        self.assertLess(len(message), 500)
+        self.assertIn("and 92 more", message)
+
 
 @dataclass
 class _DataclassNode:
