@@ -41,7 +41,7 @@ import {
 } from "./plugins";
 import { explorationEffectsShouldLoad, neighborhoodPanelShouldLoad, temporalOverlayShouldLoad } from "./pluginRegistryPredicates";
 import { shouldFetchTemporalBounds, shouldFetchTemporalSnapshot } from "./temporalLifecyclePredicates";
-import { createTemporalSnapshotGuards } from "./temporalSnapshotGuards";
+import { createTemporalSnapshotGuards, type TemporalSnapshotResponse } from "./temporalSnapshotGuards";
 import type { LinkPrediction, PathResponse } from "./GraphInspectorPanel";
 import type { GraphSceneHandle, GraphSceneRuntime } from "./scene";
 import type {
@@ -1480,15 +1480,22 @@ export function GraphWorkspace({ externalFocusNodeId, externalFocusToken }: Grap
     summary?.edgeCount,
   ]);
 
-  // Guards the snapshot lifecycle: one request per scrubber position
-  // (identical-`at` re-fetch is dropped, breaking the idle/play polling loop)
-  // and latest-wins application (out-of-order responses cannot clobber a newer
-  // active-node count, fixing chip lag behind the scrubber).
+  // Guards the snapshot lifecycle: at most one in-flight request per scrubber
+  // position (identical-`at` polls are deduplicated, breaking the idle/play
+  // polling loop), applied snapshots are cached and re-applied on revisit, and
+  // a response applies only while the scrubber is still on its position
+  // (out-of-order responses cannot clobber the active-node count).
   const temporalSnapshotGuardsRef = useRef<ReturnType<typeof createTemporalSnapshotGuards> | null>(null);
   if (temporalSnapshotGuardsRef.current === null) {
     temporalSnapshotGuardsRef.current = createTemporalSnapshotGuards();
   }
   const temporalSnapshotGuards = temporalSnapshotGuardsRef.current;
+
+  // A new graph summary means the graph data was replaced (reload/retry);
+  // snapshots cached against the previous graph are stale, so reset all state.
+  useEffect(() => {
+    temporalSnapshotGuards.reset();
+  }, [summary]);
 
   useEffect(() => {
     if (!canFetchTemporalSnapshot) {
@@ -1500,44 +1507,66 @@ export function GraphWorkspace({ externalFocusNodeId, externalFocusToken }: Grap
     }
 
     const atMs = debouncedTime.getTime();
-    if (temporalSnapshotGuards.shouldRequest(atMs)) {
+    const { seq, cached } = temporalSnapshotGuards.begin(atMs);
+    if (seq === null) {
+      // An identical request is already in flight: one request per position.
       return;
     }
-    const requestSeq = temporalSnapshotGuards.begin(atMs);
 
     let cancelled = false;
+
+    const applyData = (data: TemporalSnapshotResponse) => {
+      const nextActiveIds = new Set(data.active_node_ids);
+      requestAnimationFrame(() => {
+        if (cancelled) return;
+        if (!temporalSnapshotGuards.shouldApply(atMs, seq)) {
+          // The scrubber moved on (or this request was superseded): release the
+          // position so a return to it refetches instead of stalling.
+          temporalSnapshotGuards.finish(atMs, seq);
+          return;
+        }
+        const previous = prevActiveIdsRef.current;
+        previous.forEach((id) => {
+          if (!nextActiveIds.has(id) && graph.hasNode(id)) {
+            graph.setNodeAttribute(id, "hidden", true);
+          }
+        });
+        nextActiveIds.forEach((id) => {
+          if (graph.hasNode(id)) {
+            graph.setNodeAttribute(id, "hidden", false);
+          }
+        });
+        prevActiveIdsRef.current = nextActiveIds;
+        setActiveNodeCount(data.active_node_count);
+        setGraphVersion((current) => current + 1);
+        sceneRef.current?.getRuntime()?.requestRender();
+        temporalSnapshotGuards.apply(atMs, seq, data);
+      });
+    };
+
+    if (cached) {
+      // Returning to a position whose snapshot was already applied: re-apply
+      // the cached result without a network request.
+      applyData(cached);
+      return;
+    }
 
     const applySnapshot = async () => {
       try {
         const at = debouncedTime.toISOString();
         const response = await fetch(`/api/temporal/snapshot?at=${encodeURIComponent(at)}`);
-        if (!response.ok || cancelled) return;
-
-        const data: { active_node_ids: string[]; active_node_count: number } = await response.json();
+        if (!response.ok) {
+          // A failed request must be retryable if the scrubber returns.
+          if (!cancelled) temporalSnapshotGuards.finish(atMs, seq);
+          return;
+        }
         if (cancelled) return;
 
-        const nextActiveIds = new Set(data.active_node_ids);
-        requestAnimationFrame(() => {
-          if (cancelled) return;
-          if (!temporalSnapshotGuards.shouldApply(atMs, requestSeq)) return;
-          const previous = prevActiveIdsRef.current;
-          previous.forEach((id) => {
-            if (!nextActiveIds.has(id) && graph.hasNode(id)) {
-              graph.setNodeAttribute(id, "hidden", true);
-            }
-          });
-          nextActiveIds.forEach((id) => {
-            if (graph.hasNode(id)) {
-              graph.setNodeAttribute(id, "hidden", false);
-            }
-          });
-          prevActiveIdsRef.current = nextActiveIds;
-          setActiveNodeCount(data.active_node_count);
-          setGraphVersion((current) => current + 1);
-          sceneRef.current?.getRuntime()?.requestRender();
-          temporalSnapshotGuards.apply(requestSeq);
-        });
+        const data: TemporalSnapshotResponse = await response.json();
+        if (cancelled) return;
+        applyData(data);
       } catch (fetchError) {
+        temporalSnapshotGuards.finish(atMs, seq);
         if (!cancelled) {
           console.error("[Temporal] Snapshot fetch failed", fetchError);
         }
@@ -1547,6 +1576,8 @@ export function GraphWorkspace({ externalFocusNodeId, externalFocusToken }: Grap
     applySnapshot();
     return () => {
       cancelled = true;
+      // A cancelled request must be retryable when its position is revisited.
+      temporalSnapshotGuards.finish(atMs, seq);
     };
   }, [
     canFetchTemporalSnapshot,

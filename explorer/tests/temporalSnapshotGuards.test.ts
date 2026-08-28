@@ -7,82 +7,144 @@ const POSITION_1 = new Date("2023-07-02T00:00:00Z").getTime();
 const POSITION_2 = new Date("2024-01-02T00:00:00Z").getTime();
 const POSITION_3 = new Date("2024-07-02T00:00:00Z").getTime();
 
-// ── shouldRequest: one request per scrubber position ─────────────────────────
+const SNAPSHOT = { active_node_ids: ["n1", "n2"], active_node_count: 2 };
 
-test("shouldRequest: false for a never-requested position", () => {
+// ── begin: one request per scrubber position ─────────────────────────────────
+
+test("begin: a new position returns a fresh request sequence", () => {
   const guards = createTemporalSnapshotGuards();
-  assert.equal(guards.shouldRequest(POSITION_1), false);
+  assert.deepEqual(guards.begin(POSITION_1), { seq: 1, cached: null });
 });
 
-test("shouldRequest: true once that position has been requested", () => {
+test("begin: an identical in-flight request is deduplicated (no duplicate fetch)", () => {
   const guards = createTemporalSnapshotGuards();
   guards.begin(POSITION_1);
-  assert.equal(guards.shouldRequest(POSITION_1), true);
+  assert.deepEqual(guards.begin(POSITION_1), { seq: null, cached: null });
 });
 
-test("shouldRequest: distinct positions are requested independently", () => {
+test("begin: distinct positions request independently", () => {
   const guards = createTemporalSnapshotGuards();
-  guards.begin(POSITION_1);
-  assert.equal(guards.shouldRequest(POSITION_1), true);
-  assert.equal(guards.shouldRequest(POSITION_2), false);
+  assert.equal(guards.begin(POSITION_1).seq, 1);
+  assert.equal(guards.begin(POSITION_2).seq, 2);
 });
 
-test("shouldRequest: returning to an earlier position does not re-request (play wrap-around)", () => {
+test("begin: revisiting an applied position returns its cached snapshot", () => {
   const guards = createTemporalSnapshotGuards();
-  guards.begin(POSITION_1);
-  guards.begin(POSITION_2);
-  guards.begin(POSITION_3);
-  // Play mode wraps back to the min bound; that position was already fetched.
-  assert.equal(guards.shouldRequest(POSITION_1), true);
+  const { seq } = guards.begin(POSITION_1);
+  guards.apply(POSITION_1, seq, SNAPSHOT);
+  const revisit = guards.begin(POSITION_1);
+  assert.equal(revisit.seq, 2);
+  assert.deepEqual(revisit.cached, SNAPSHOT);
 });
 
-// ── begin: monotonically increasing request sequence ─────────────────────────
-
-test("begin: returns an incrementing sequence per request", () => {
+test("begin: a failed position (finished) can be requested again", () => {
   const guards = createTemporalSnapshotGuards();
-  assert.equal(guards.begin(POSITION_1), 1);
-  assert.equal(guards.begin(POSITION_2), 2);
-  assert.equal(guards.begin(POSITION_3), 3);
+  const { seq } = guards.begin(POSITION_1);
+  guards.finish(POSITION_1, seq);
+  const retry = guards.begin(POSITION_1);
+  assert.equal(retry.seq, 2);
+  assert.equal(retry.cached, null);
 });
 
-// ── shouldApply: latest-wins ordering guard (chip lag fix) ───────────────────
-
-test("shouldApply: the first response for a position is applied", () => {
+test("finish: does not clear a position whose snapshot was already applied", () => {
   const guards = createTemporalSnapshotGuards();
-  const seq = guards.begin(POSITION_1);
+  const { seq } = guards.begin(POSITION_1);
+  guards.apply(POSITION_1, seq, SNAPSHOT);
+  guards.finish(POSITION_1, seq);
+  assert.deepEqual(guards.begin(POSITION_1).cached, SNAPSHOT);
+});
+
+test("finish: a stale sequence cannot release a newer request's position", () => {
+  const guards = createTemporalSnapshotGuards();
+  const first = guards.begin(POSITION_1);
+  guards.finish(POSITION_1, first.seq);
+  guards.begin(POSITION_1); // seq 2, in flight again
+  guards.finish(POSITION_1, first.seq); // stale seq: must not release seq 2
+  assert.deepEqual(guards.begin(POSITION_1), { seq: null, cached: null });
+});
+
+// ── shouldApply: applied only while the scrubber is on that position ─────────
+
+test("shouldApply: the current position's response is applied", () => {
+  const guards = createTemporalSnapshotGuards();
+  const { seq } = guards.begin(POSITION_1);
   assert.equal(guards.shouldApply(POSITION_1, seq), true);
 });
 
-test("shouldApply: a response for an older request is discarded when a newer request exists", () => {
+test("shouldApply: a response for a position the scrubber left is discarded", () => {
   const guards = createTemporalSnapshotGuards();
-  const seq1 = guards.begin(POSITION_1);
-  const seq2 = guards.begin(POSITION_2);
-  // The slow POSITION_1 response lands after POSITION_2 was requested.
+  const { seq: seq1 } = guards.begin(POSITION_1);
+  guards.begin(POSITION_2);
   assert.equal(guards.shouldApply(POSITION_1, seq1), false);
-  assert.equal(guards.shouldApply(POSITION_2, seq2), true);
+  assert.equal(guards.shouldApply(POSITION_2, 2), true);
 });
 
-test("shouldApply: the same response is never applied twice", () => {
+test("shouldApply: a late response for the position the scrubber returned to is applied", () => {
   const guards = createTemporalSnapshotGuards();
-  const seq = guards.begin(POSITION_1);
-  guards.apply(seq);
-  assert.equal(guards.shouldApply(POSITION_1, seq), false);
+  const { seq: seq1 } = guards.begin(POSITION_1);
+  const { seq: seq2 } = guards.begin(POSITION_2);
+  guards.begin(POSITION_1); // back to 1: deduplicated, no new request
+  assert.equal(guards.shouldApply(POSITION_1, seq1), true);
+  assert.equal(guards.shouldApply(POSITION_2, seq2), false);
 });
 
-test("shouldApply: full out-of-order sequence keeps only the newest response", () => {
-  const guards = createTemporalSnapshotGuards();
-  const seq1 = guards.begin(POSITION_1);
-  const seq2 = guards.begin(POSITION_2);
-  const seq3 = guards.begin(POSITION_3);
-  // Responses arrive out of order: POSITION_1 (slowest) first, POSITION_3 last.
-  assert.equal(guards.shouldApply(POSITION_1, seq1), false, "stale response must be dropped");
-  assert.equal(guards.shouldApply(POSITION_3, seq3), true, "newest response must apply");
-  guards.apply(seq3);
-  assert.equal(guards.shouldApply(POSITION_2, seq2), false, "late middle response must be dropped");
-});
-
-test("shouldApply: a response for an unknown sequence is discarded", () => {
+test("shouldApply: an unknown sequence is discarded", () => {
   const guards = createTemporalSnapshotGuards();
   guards.begin(POSITION_1);
   assert.equal(guards.shouldApply(POSITION_1, 99), false);
+});
+
+test("shouldApply: after a reset no pre-reset response applies", () => {
+  const guards = createTemporalSnapshotGuards();
+  const { seq } = guards.begin(POSITION_1);
+  guards.reset();
+  assert.equal(guards.shouldApply(POSITION_1, seq), false);
+});
+
+// ── apply: caching for revisits ─────────────────────────────────────────────
+
+test("apply: stores the snapshot so a revisit re-applies it without a request", () => {
+  const guards = createTemporalSnapshotGuards();
+  const { seq } = guards.begin(POSITION_1);
+  guards.apply(POSITION_1, seq, SNAPSHOT);
+  guards.begin(POSITION_2);
+  assert.deepEqual(guards.begin(POSITION_1).cached, SNAPSHOT);
+});
+
+test("apply: play wrap-around re-applies the wrapped-to position's snapshot", () => {
+  const guards = createTemporalSnapshotGuards();
+  const { seq } = guards.begin(POSITION_1);
+  guards.apply(POSITION_1, seq, SNAPSHOT);
+  guards.begin(POSITION_2);
+  guards.begin(POSITION_3);
+  const wrap = guards.begin(POSITION_1);
+  assert.deepEqual(wrap.cached, SNAPSHOT);
+  assert.equal(guards.shouldApply(POSITION_1, wrap.seq), true);
+});
+
+// ── reset: graph reload ─────────────────────────────────────────────────────
+
+test("reset: clears requested and cached state so positions refetch", () => {
+  const guards = createTemporalSnapshotGuards();
+  const { seq } = guards.begin(POSITION_1);
+  guards.apply(POSITION_1, seq, SNAPSHOT);
+  guards.reset();
+  const fresh = guards.begin(POSITION_1);
+  assert.equal(fresh.seq, 1);
+  assert.equal(fresh.cached, null);
+});
+
+// ── cache bound ─────────────────────────────────────────────────────────────
+
+test("cache: oldest positions are evicted when the cache is full", () => {
+  const guards = createTemporalSnapshotGuards();
+  const count = 300;
+  for (let i = 0; i < count; i++) {
+    const { seq } = guards.begin(POSITION_1 + i * 1000);
+    guards.apply(POSITION_1 + i * 1000, seq, SNAPSHOT);
+  }
+  const oldest = guards.begin(POSITION_1);
+  assert.equal(oldest.cached, null); // evicted: must refetch on revisit
+  const newest = guards.begin(POSITION_1 + (count - 1) * 1000);
+  assert.deepEqual(newest.cached, SNAPSHOT); // still cached
 });
