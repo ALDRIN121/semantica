@@ -41,6 +41,7 @@ import {
 } from "./plugins";
 import { explorationEffectsShouldLoad, neighborhoodPanelShouldLoad, temporalOverlayShouldLoad } from "./pluginRegistryPredicates";
 import { shouldFetchTemporalBounds, shouldFetchTemporalSnapshot } from "./temporalLifecyclePredicates";
+import { createTemporalSnapshotGuards } from "./temporalSnapshotGuards";
 import type { LinkPrediction, PathResponse } from "./GraphInspectorPanel";
 import type { GraphSceneHandle, GraphSceneRuntime } from "./scene";
 import type {
@@ -1479,6 +1480,16 @@ export function GraphWorkspace({ externalFocusNodeId, externalFocusToken }: Grap
     summary?.edgeCount,
   ]);
 
+  // Guards the snapshot lifecycle: one request per scrubber position
+  // (identical-`at` re-fetch is dropped, breaking the idle/play polling loop)
+  // and latest-wins application (out-of-order responses cannot clobber a newer
+  // active-node count, fixing chip lag behind the scrubber).
+  const temporalSnapshotGuardsRef = useRef<ReturnType<typeof createTemporalSnapshotGuards> | null>(null);
+  if (temporalSnapshotGuardsRef.current === null) {
+    temporalSnapshotGuardsRef.current = createTemporalSnapshotGuards();
+  }
+  const temporalSnapshotGuards = temporalSnapshotGuardsRef.current;
+
   useEffect(() => {
     if (!canFetchTemporalSnapshot) {
       return;
@@ -1487,6 +1498,12 @@ export function GraphWorkspace({ externalFocusNodeId, externalFocusToken }: Grap
     if (!debouncedTime) {
       return;
     }
+
+    const atMs = debouncedTime.getTime();
+    if (temporalSnapshotGuards.shouldRequest(atMs)) {
+      return;
+    }
+    const requestSeq = temporalSnapshotGuards.begin(atMs);
 
     let cancelled = false;
 
@@ -1502,6 +1519,7 @@ export function GraphWorkspace({ externalFocusNodeId, externalFocusToken }: Grap
         const nextActiveIds = new Set(data.active_node_ids);
         requestAnimationFrame(() => {
           if (cancelled) return;
+          if (!temporalSnapshotGuards.shouldApply(atMs, requestSeq)) return;
           const previous = prevActiveIdsRef.current;
           previous.forEach((id) => {
             if (!nextActiveIds.has(id) && graph.hasNode(id)) {
@@ -1517,6 +1535,7 @@ export function GraphWorkspace({ externalFocusNodeId, externalFocusToken }: Grap
           setActiveNodeCount(data.active_node_count);
           setGraphVersion((current) => current + 1);
           sceneRef.current?.getRuntime()?.requestRender();
+          temporalSnapshotGuards.apply(requestSeq);
         });
       } catch (fetchError) {
         if (!cancelled) {
