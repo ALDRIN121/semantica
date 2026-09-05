@@ -918,10 +918,10 @@ def doctor(cli_ctx: CLIContext, local_json: bool, deep_embeddings: bool) -> None
             return
 
         tbl = Table(box=_TABLE_BOX, show_edge=False, padding=(0, 2), expand=True)
-        tbl.add_column("Check",  style=_KEY, no_wrap=True, min_width=16, ratio=1)
-        tbl.add_column("Status", no_wrap=True, min_width=6, ratio=1)
-        tbl.add_column("Note",   style=_DIM, min_width=15, ratio=2)
-        tbl.add_column("Hint",   style=_DIM, min_width=25, ratio=3, overflow="fold")
+        tbl.add_column("Check",  style=_KEY, no_wrap=True, min_width=34)
+        tbl.add_column("Status", no_wrap=True, min_width=4)
+        tbl.add_column("Note",   style=_DIM, min_width=15, ratio=2, overflow="fold")
+        tbl.add_column("Hint",   style=_DIM, min_width=20, ratio=3, overflow="fold")
 
         icons = {"ok": f"[{_SUCCESS}] ✓[/{_SUCCESS}]",
                  "warn": f"[{_WARN_STY}] ⚠[/{_WARN_STY}]",
