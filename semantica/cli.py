@@ -5877,7 +5877,7 @@ def explorer(ctx: click.Context) -> None:
 
 
 @explorer.command("start")
-@click.option("--port", default=5173, type=int, show_default=True)
+@click.option("--port", default=5173, type=click.IntRange(1, 65535), show_default=True)
 @click.option("--api-url", default="http://localhost:8000", show_default=True)
 @click.option("--graph", default=None, type=click.Path(exists=True),
               help="Optional graph JSON file to preload.")
@@ -5931,7 +5931,7 @@ def explorer_status(cli_ctx: CLIContext, local_json: bool) -> None:
 
 
 @explorer.command("open")
-@click.option("--port", default=5173, type=int, show_default=True)
+@click.option("--port", default=5173, type=click.IntRange(1, 65535), show_default=True)
 @click.pass_obj
 def explorer_open(cli_ctx: CLIContext, port: int) -> None:
     """Open the Explorer in the default browser."""
